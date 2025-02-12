@@ -1,0 +1,986 @@
+---
+title: "FH models, Anemia"
+subtitle: "SAE Estimators"
+author: "[Angelo Cozzubo] \n(https://sites.google.com/pucp.pe/acozz)"
+date creation: "05/04/2022"
+date last edit: "`r Sys.Date()`"
+output:
+  html_document:
+  df_print: paged
+  html_notebook: default
+  pdf_document: default
+  word_document: default
+editor_options: 
+  markdown: 
+  wrap: 80
+bibliography: references.bib
+---
+
+This R Markdown file computes the Small Area Estimation (SAE) results for Anemia in Peru at the provincial level. Our project is conducted as part of the 2022 Venture Fund awarded to our project "Exploiting Data to its fullest: Machine Learning and Small Area Estimation" (code LABO.10.35). We are grateful to NORC for this award and to the National Statistical Office in Peru, INEI, for sharing their public and non-public datasets with us to carry on with our application. Any potential remaining errors are my own.
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:\\Users\\cozzubo-angelo\\OneDrive - National Opinion Research Center\\VF_SAEML\\")
+getwd()
+```
+
+## 0. Preliminaries {.unnumbered}
+
+First, we start loading (and installing if required) the packages we will be using.
+
+```{r packages}
+set.seed(123)
+# install and load the packages
+pacman::p_load(sae, haven, tidyverse, ggpubr, 
+               labelled, survey, dplyr, moments,
+               caret, sf, tmap, spdep, rgdal, StepReg,
+               sparsepca, emdi, maptools, gpclib, SAEval,
+               glmmLasso, rospca, readxl, writexl) 
+gpclibPermit()
+```
+
+We set the working directory and specific routes.
+
+```{r}
+setwd("C:\\Users\\cozzubo-angelo\\OneDrive - National Opinion Research Center\\VF_SAEML\\")
+
+# paths
+wd <- file.path("C:\\Users\\cozzubo-angelo\\OneDrive - National Opinion Research Center\\VF_SAEML\\")
+scripts <- file.path("02_scripts\\FH\\")
+data <- file.path("03_data\\") 
+outputs <- file.path("04_results\\") 
+```
+
+Connect to user-written functions available in the script `my_fns.R`: SpatialFH, choropleths
+
+```{r}
+source(paste(scripts,"my_fns.R", sep="\\"))
+```
+
+And we load the datasets that are in Stata format (.dta)
+
+```{r}
+endes <- read_dta(paste(data, "original", "ENDES_TOT.dta", sep="\\"))
+var_labels <- var_label(endes)
+tot_pob_prov <- read_dta(paste(data, "covariates", "censo2017_tot_pob_prov.dta", sep="\\"))
+```
+
+We performe a simple summary of the datasets, and remove the observations with missing province ID
+
+```{r dropmiss, include=FALSE}
+# sample size by province 
+#sort(table(endes$ID_PROV), decreasing = TRUE)
+#remove obs with missing IDPROV
+endes <- endes[!(is.na(endes$ID_PROV) | 
+                   endes$ID_PROV==""),]
+
+#IDDPTO 26 and 27 belong to Lima. 
+#Split by INEI for size reasons. Change code
+endes$ID_DEP <- gsub('26', '15', endes$ID_DEP)
+endes$ID_DEP <- gsub('27', '15', endes$ID_DEP)
+
+#IDPROV as numeric 
+endes <- transform(endes, ID_PROV = as.numeric(ID_PROV)) 
+```
+
+And declare sampling design of the survey to later compute the direct estimates. We are using the pooled DHS dataset (Endes) for the years 2017-2019. This is a survey with complex design (stratified, multiple selection stages, etc.) and contains all the required information to declare the design and compute weighted estimators (sampling weights).
+
+```{r svy}
+endes <- transform(endes, 
+                   ID_UBICONG = as.numeric(ID_UBICONG), 
+                   ID_NINIO = as.numeric(ID_NINIO))
+dclus2 <- svydesign(id=endes$ID_UBICONG+endes$ID_NINIO, 
+                    strata=endes$HV022, nest=TRUE,
+                    weights = endes$FACTOR_NINIO_2, 
+                    data=endes)
+```
+
+## 1. Direct estimates from survey data {.unnumbered}
+
+First, we compute the total sample size, number of domains (in our case, provinces), sample size in each province and population totals from Census data. We drop province 1608 as it was not included in the survey data and province 209 as it does not have any case of anemia (variance = 0).
+
+```{r}
+n <- dim(endes)[1] # Tamaño muestral total
+D <- length(unique(endes$ID_PROV)) # Número de provincias (áreas o dominios)
+nd <- as.vector(table(endes$ID_PROV)) # Tamaños muestrales de las provincias
+
+#this provinces is dropped below. 
+nd_ <- as.vector(table(endes[!(endes$ID_PROV=="209"),]$ID_PROV)) 
+```
+
+```{r, population totals}
+# drop prov 1608 (Putumayo, Loreto) not included in endes
+tot_pob_prov <- tot_pob_prov[!(tot_pob_prov$ID_PROV=="1608"),]
+tot_pob_prov <- transform(tot_pob_prov, ID_PROV = as.numeric(ID_PROV)) 
+Nd <- tot_pob_prov$tot_pob_0_4 # Tamaños poblacionales de las provincias CPV
+```
+
+```{r, outcome}
+anemia <- numeric(n)
+anemia [endes$ANEMIA==1] <- 1
+```
+
+#### 1.1 Compute direct estimates with `survey` package (Horvitz-Thompson) {.unnumbered}
+
+```{r}
+#svymean(endes$ANEMIA, dclus2, na.rm=TRUE) #national 
+prov.dir.svy <- svyby(~ANEMIA, 
+                        ~ID_PROV, 
+                        dclus2, 
+                        svymean, 
+                        na.rm=T) 
+prov.dir.svy <- prov.dir.svy[!(prov.dir.svy$ID_PROV=="209"),]
+prov.dir.svy$CV <- (prov.dir.svy$se/prov.dir.svy$ANEMIA)*100
+prov.dir.svy$var <- (prov.dir.svy$se)^2
+
+write.csv(prov.dir.svy,
+          paste(outputs, "direct_estimates_svy.csv", sep="\\"), 
+          row.names = TRUE)
+```
+
+```{r}
+# Unacceptable CVs for direct estimates
+summary(prov.dir.svy$CV)
+sum(prov.dir.svy$CV>15)
+sum(prov.dir.svy$CV>20)
+
+# jpeg(paste(outputs, "direct_CV_histogram.jpg", sep="\\"),
+#       width = 700, height = 500)
+d <- density(prov.dir.svy$CV,prob=TRUE, main="", 
+     xlab="Coefficient of variation for direct estimates",
+     breaks = c(0,5,10,15,20,40,100), labels=T)
+plot(d, main="Coefficient of variation for direct estimates")
+abline(v=15, col="red")
+# mtext("CV of 15", side = 0.5, line = 0.5, cex = 0.7, adj = 0) 
+```
+
+Check normality of the direct estimates and plot CDF
+
+```{r}
+summary(prov.dir.svy$ANEMIA)
+
+# jpeg(paste(outputs, "direct_estim_histogram.jpg", sep="\\"),
+#       width = 600, height = 400)
+hist(prov.dir.svy$ANEMIA,prob=TRUE, main="",
+    xlab="Anemia Incidence. Direct estimates")
+
+# jpeg(paste(outputs, "direct_estim_CDF.jpg", sep="\\"),
+#       width = 600, height = 400)
+plot(ecdf(prov.dir.svy$ANEMIA*100), 
+     xlab="Anemia Incidence (%). Direct estimates", 
+     ylab='Cumulative Density Function', 
+     main='') 
+```
+
+Formal tests of normality
+
+```{r}
+#testing normality 
+shapiro.test(prov.dir.svy$ANEMIA)
+ks.test(prov.dir.svy$ANEMIA, 'pnorm')
+jarque.test(prov.dir.svy$ANEMIA)
+print(paste("Skweness", skewness(prov.dir.svy$ANEMIA)))
+print(paste("Kurtosis", kurtosis(prov.dir.svy$ANEMIA)))
+ggqqplot(prov.dir.svy$ANEMIA)
+```
+
+## 2. Pre-processing
+
+### 2.1 Predictors
+
+We load the dataframe with all the potential predictors to use in the modelling stage. This variables are provincial averages and counts from Population Census, Agricultural Census and administrative registries. We have \~550 variables that comprise our candidate pool for the predictive stage in the Fay-Herriot.
+
+```{r, covariates CPV}
+#load 
+covar_CPV <- read_dta(paste(data, "covariates", 
+                            "censo2017_stats_prov_hogar.dta", 
+                            sep="\\"))
+
+#Filter provinces. Drop vars with NA
+covar_CPV <- covar_CPV %>% 
+                      filter(!(covar_CPV$prov=="1608" | 
+                              covar_CPV$prov=="0209")) %>% 
+                      select_if(~ !any(is.na(.))) 
+
+# Drop vars with 0 variance
+NZV_CPV <- nearZeroVar(covar_CPV)
+print(paste("Fraction of nearZeroVar columns:", 
+            round(length(NZV_CPV)/length(covar_CPV),4)))
+covar_CPV <- covar_CPV[, -NZV_CPV]
+
+#labels
+covar_CPV_labels <- var_label(covar_CPV)
+```
+
+```{r, covariates INEI}
+#load 
+covar_INEI <- read_dta(paste(data, "covariates", 
+                            "BASE_PROV.dta", 
+                            sep="\\"))
+
+#Filter provinces. Drop vars with NA
+covar_INEI <- covar_INEI %>% 
+                      filter(!(covar_INEI$PROV=="1608" | 
+                              covar_INEI$PROV=="0209")) %>% 
+                      select_if(~ !any(is.na(.))) 
+
+# Drop vars with 0 variance
+NZV <- nearZeroVar(covar_INEI)
+print(paste("Fraction of nearZeroVar columns:", 
+            round(length(NZV)/length(covar_INEI),4)))
+covar_INEI <- covar_INEI[, -NZV]
+
+#labels 
+covar_INEI_labels <- var_label(covar_INEI)
+```
+
+### 2.2 Create spatial matrix
+
+Now, we load the provincial shapefile and create the contiguity matrix to compute the Spatial version of the Fay-Herriot model (SFH). We employ the more general standardized "queen" matrix.
+
+```{r}
+sf::sf_use_s2(FALSE)
+shp <- st_read(dsn = paste(data, "shapes", "PROVINCIA_19_12_2015.shp", sep="\\"))
+
+#Filter provinces. Drop vars with NA
+shp <- shp %>% 
+              filter(!(shp$IDPROV=="1608" | 
+                       shp$IDPROV=="0209")) 
+shp_sp <- readOGR(paste(data, "shapes", "PROVINCIA_19_12_2015.shp", sep="\\"))
+```
+
+```{r}
+#The centroids:
+shp_centroid <- st_point_on_surface(x = shp)
+
+#The euclidian distance matrix:
+mtx_distance <- st_distance(shp_centroid, shp_centroid)
+
+#Queen matrix: may need tmap spdep rgdal
+wm_q <- poly2nb(shp, queen = TRUE)
+wmat <- nb2mat(wm_q, style="W", zero.policy=TRUE)
+```
+
+We test the spatial correlation of anemia at the province level. We observe a positive and moderate spatial correlation of 0.5 by the Moran's I.
+
+```{r}
+# Spatial correlation test (Moran goes [-1, 1])
+spatialcor.tests(direct = prov.dir.svy$ANEMIA, 
+                 corMatrix = wmat)
+```
+
+Following Molina & Maruenda documentation of the SAE package, the Spatial Fay Herriot model will be
+
+$$\tilde \delta^{FH}_{p} = x^{'}_{p}\tilde\beta + u_p + e_p $$
+
+Where $\tilde \delta^{FH}_{p}$ is the vector of direct (Horvitz-Thompson) estimates for the P small areas, $x^{'}_{p}$ is a matrix containing in its columns the values of explanatory variables for the areas, $u_p$ is the vector of area effects and $e_p$ is the vector of independent sampling errors, independent of $u_p$ , with $e_p \sim N(0_p, \Psi_p)$ where the covariance matrix $\Psi_p$ is known.
+
+The vector $u_p$ follows an simultaneously autoregressive (SAR) process with unknown autoregression parameter and proximity matrix $W$
+
+$$u_p=\rho Wu_p + \eta_p $$ We assume that the matrix $(I_p-\rho W)$ is non-singular, where $I_p$ denotes the identity matrix. Then $u_p$ be expressed as
+
+$$u_p=(I_p-\rho W)^{-1} \eta_p $$ where $\eta_p$ satisfies $\eta_p\sim N(0_p, AI_p)$ for $A$ unknown.
+
+The matrix $W$ is obtained from an original proximity matrix $W^0$, whose diagonal elements area equal to zero and the remaining entries are equal to 1 when the two areas corresponding to the row and the column indices are considered as neighbor and zero otherwise. Then $W$ is obtained by row-standardization of $W^0$, obtained by dividing each entry $W^0$of by the sum of elements in the same row, see Anselin (1988). In our case, we are employing a queen proximity matrix.
+
+### 2.3 Full dataframe with standardized covariates
+
+Combine dataframe with direct estimates and all covariates. Standardize covariates
+
+```{r}
+#combine direct estimates and X's
+combined_data <- data.frame(prov.dir.svy$ANEMIA, prov.dir.svy$ID_PROV)
+not_candidates <- c( "ANEMIA", "ID_PROV")
+colnames(combined_data) <- not_candidates
+
+combined_data <- merge(combined_data, 
+                       transform(covar_CPV, prov = as.numeric(prov)), 
+                       by.x="ID_PROV", by.y="prov")
+combined_data <- merge(combined_data, 
+                       transform(covar_INEI, PROV = as.numeric(PROV)), 
+                       by.x="ID_PROV", by.y="PROV")
+
+#Standardize all covars except ID and direct estim 
+combined_data[,!names(combined_data) %in% not_candidates] <- 
+  scale(combined_data)[,!names(combined_data) %in% not_candidates]
+
+rm(covar_CPV, covar_INEI)
+```
+
+## 3. Benchmark model: Expert's selection Spatial Fay-Herriot
+
+### 3.1 Expert covariates selection
+
+We interviewed four experts in Peru. They all agreed in seven variables (intersection criteria)
+
+```{r}
+expert.vars <- c("SIEN_CLAP_PCDP2017_PROV", "SIS_CRED_M_17191_PROV",
+                 "RNU_SIS_PROV", "SIS_CRED_M_17194_PROV", "SIS_CRED_M_17193_PROV",
+                 "POBREZA_PT_PROV", "SIS_CRED_M_17192_PROV")
+
+#Selected vars dataframe
+experts.vars.df <- data.matrix(cbind(const=rep(1,D-1), 
+                                   combined_data[,names(combined_data)
+                                                 %in% c(expert.vars)]))
+```
+
+### 3.2 Run SFH with variables selected by experts
+
+```{r}
+expert.model <- SpatialFH(prov.dir.svy$ANEMIA, # direct estimate
+                           experts.vars.df, # predictor vars 
+                           (prov.dir.svy$se)^2, # direct estim variance
+                           wmat) # contiguity matrix
+```
+
+## 4. Stepwise Spatial Fay-Herriot
+
+For this model, we perform a bidirectional stepwise selection using 2° order AIC as criteria. We include a significance level of 0.05 or below to be more restrictive with the number of variables selected.
+
+### 4.1 Stepwise selection
+
+```{r}
+#Formula 
+y <- "ANEMIA"
+x_candidates <- colnames(combined_data[,!names(combined_data)
+                                        %in% not_candidates])
+step_formula <- as.formula(paste(y, " ~ ", paste(x_candidates, 
+                                          collapse= "+")))
+```
+
+```{r}
+#Stepwise
+stp.sel <- stepwise(formula=step_formula, 
+                    data=combined_data, 
+                    selection="bidirection", #bidirection, score
+                    sle=0.05, # significance is irrelevant 
+                    sls=0.05, # significance is irrelevant 
+                    select="AICc") #2°order AIC, ↑penalization if ↓n
+
+#Selected vars (no constant)
+stepw.vars <- stp.sel[["Varaibles"]][!stp.sel[["Varaibles"]] %in% c('1')]
+
+#Selected vars dataframe
+stepw.vars.df <- data.matrix(cbind(const=rep(1,D-1), 
+                                   combined_data[,names(combined_data)
+                                                 %in% c(stepw.vars)]))
+print(paste("Number of variables selected:", length(stepw.vars)))
+stepw.vars
+```
+
+### 4.2 Run SFH with selected variables by stepwise
+
+```{r}
+stepw.model <- SpatialFH(prov.dir.svy$ANEMIA, # direct estimate
+                         stepw.vars.df, # predictor vars 
+                         (prov.dir.svy$se)^2, # direct estim variance
+                         wmat) # contiguity matrix
+```
+
+## 5. LASSO Spatial Fay-Herriot
+
+In contrast with stepwise selection, LASSO is very sensitive to high correlation in predictor variables (see, Hastie, et al 2009). This may result in LASSO choosing randomly between a pair of predictor that are correlated. Additionally, as we are inverting a matrix to compute the solution, correlations near one may cause problems by creating an (almost) singular matrix.
+
+To overcome this, we first do a correlation filter. To be very conservative, we choose a very high cutoff for the correlation to discard variables. We also discard the direct estimates with CV\>15 for var selection.
+
+```{r}
+noncorr_data_all <- data.frame(cbind(combined_data, prov.dir.svy$CV))
+noncorr_data_all <- noncorr_data_all[noncorr_data_all$prov.dir.svy.CV < 15,]
+```
+
+```{r}
+noncorr_data <- noncorr_data_all[,!names(noncorr_data_all)
+                                        %in% c(not_candidates, "prov.dir.svy.CV")]
+df2 = cor(noncorr_data)
+hc = findCorrelation(df2, cutoff=0.7) #cutoff is taken as abs()
+hc = sort(hc)
+noncorr_data  = noncorr_data[,-c(hc)]
+
+## paste ID and y = ANEMIA
+noncorr_data <- data.frame(cbind(noncorr_data_all[,names(noncorr_data_all) 
+                                                  %in% not_candidates],
+                                 noncorr_data))
+rm(noncorr_data_all, df2, hc)
+```
+
+### 5.1 LASSO selection with GridSearch for optimal lambda
+
+Here, I will use GridSearch for optimal lambda going from 0 (OLS) to the value that makes all slopes=0. I will not be using cross-validation for several reasons:
+
+-   We will not predict out of sample
+
+-   If we do train-test splitting, we cannot include province random effects (RE). This because each province has only one observation, hence the test sample will have RE for provinces not seen in the training data. The algorithm will not be able to predict as it does not have this slopes.
+
+-   We can include region RE (subnational level 1) but this will not be ideal as the SFH uses province RE.
+
+```{r}
+#Formula 
+y <- "ANEMIA"
+x_candidates <- colnames(noncorr_data[,!names(noncorr_data)
+                                        %in% not_candidates])
+lasso_formula <- as.formula(paste(y, " ~ ", paste(x_candidates, 
+                                          collapse= "+")))
+```
+
+```{r}
+noncorr_data$ID_PROV <- factor(noncorr_data$ID_PROV)
+
+#family 
+family = gaussian(link="identity")
+
+#lambda grid 
+lambda <- seq(15, 0, by=-0.5) # lambda=15 makes all coef=0
+
+#AIC y BIC vector to choose best model (only from training)
+BIC_vec <- rep(Inf, length(lambda))
+AIC_vec <- rep(Inf, length(lambda))
+sse <- rep(Inf, length(lambda)) # sum of squared errors 
+```
+
+```{r, results = 'hide', error=F, warning=F}
+# Iterate for each lambda in each fold 
+for(j in 1:length(lambda)) {
+    
+  print(paste("Iteration ", j, sep=""))
+  
+ #model fit 
+  glm2 <- try(glmmLasso(lasso_formula,
+                        rnd = list(ID_PROV = ~1), #random effects
+                        lambda=lambda[j],
+                        family = family, data = noncorr_data,
+                        switch.NR=F, final.re=TRUE,
+                        control=list(print.iter=F))
+              ,silent=TRUE)
+  
+  if(class(glm2) != "try-error"){  
+    BIC_vec[j]<-glm2$bic
+    AIC_vec[j]<-glm2$aic
+    sse[j]<-sum((glm2$y_hat-noncorr_data$ANEMIA)**2) 
+  }
+}
+```
+
+Optimal model
+
+```{r, results = 'hide', error=F, warning=F}
+# Lambda that minimizes SSE 
+opt2 <- which.min(sse)
+
+# Fit model with optimal lambda 
+glm2_final <- glmmLasso(lasso_formula, 
+                        rnd = list(ID_PROV = ~1), #random effects
+                        lambda=lambda[opt2],
+                        family = family, data = noncorr_data, 
+                        switch.NR=F,final.re=TRUE,
+                        control = list(print.iter=F))
+```
+
+```{r}
+# Obtain selected variables 
+df2 <- data.frame(glm2_final$coefficients)
+df2 <- cbind(vars = rownames(df2), df2)
+df2 <- filter(df2, glm2_final.coefficients!=0) %>% #non selected
+       filter(row_number()!=1) #intercept
+lasso.vars <- df2$vars
+
+#Selected vars df 
+lasso.vars.df <- data.matrix(cbind(const=rep(1,D-1), 
+                                   combined_data[,names(combined_data)
+                                                 %in% c(lasso.vars)]))
+print(paste("Number of variables selected:", length(lasso.vars)))
+lasso.vars
+#rm(df2)
+```
+
+Plotting lambdas
+
+```{r}
+lambda.df <- data.frame(lambda, sse)
+
+# jpeg(paste(outputs, "lambda_plot.jpg", sep="\\"),
+#      width = 500, height = 500)
+
+plot(lambda.df$lambda, lambda.df$sse,  type="l", xlab="Lambda", ylab="Sum Squared Errors (SSE)", ) #ylim=c(0,10))
+abline(v=lambda[opt2], col="red")
+abline(v=max(lambda), col="red")
+lbl <- paste0("Optimal Lambda = ", 
+              as.character(lambda[opt2]), "\nMinimizes SSE")
+lbl2 <- paste0("Max Lambda = ", 
+               as.character(max(lambda)), "\nNo covariates \nselected")
+text(lambda[opt2], max(1), label = lbl, col="red", pos = 4)
+text(max(lambda)-2, max(1), label = lbl2, col="red", pos = 1)
+```
+
+### 5.2 Run SFH with selected variables
+
+```{r}
+lasso.model <- SpatialFH(prov.dir.svy$ANEMIA, # direct estimate
+                         lasso.vars.df, # predictor vars 
+                         (prov.dir.svy$se)^2, # direct estim variance
+                         wmat) # contiguity matrix
+```
+
+------------------------------------------------------------------------
+
+## 6. Sparse PCA Spatial Fay-Herriot
+
+As we see from above, LASSO selects a high number of variables. This behaviour has been highlighted by Hastie et al (2009) and Hastie et al (2015) as troublesome since a LASSO regression with many covariates will likely selected a number of predictors (K) equal to the number of observations (N). This is what we believe is happening in our case, as we have 152 obs in the training, and \~100 predictors, which is not a very parsimonious model.
+
+In order to try a different approach, we implement a method coming from the multidimensionaly reduction literature, which is also part of the Machine Learning methods. This is the Sparse PCA, which is an extension of the PCA that performs variable selection. As noted by the authors of the package, the Sparse PCA avoids overfitting in a high-dimensional data setting where the number of variables K is greater than the number of observations n. The method attempts to find sparse weight vectors (loadings), i.e., a weight vector with only a few 'active' (nonzero) values.
+
+### 6.1 Sparse PCA selection
+
+We use the [one-in-twenty](https://en.wikipedia.org/wiki/One_in_ten_rule) as the max number of components to be chosen.
+
+```{r}
+X <- (combined_data[,!names(combined_data)
+                            %in% not_candidates])
+
+#Default values. We increase regularization by 100 for a sparse solution as the default value and the value multiplied by 6 gave us >90 predictors.  
+out <- rspca(X, k = round(nrow(X)/20), #one-in-twenty rule
+             alpha = 1e-04, beta = 1e-04, 
+             center = TRUE, scale = FALSE, 
+             max_iter = 1000, tol = 1e-05, 
+             o = 10, q = 2,
+             verbose = F)
+
+#PC scores are computed as  Z = XB, where B are the loadings 
+#Keep the PC with variance 
+Z <- out$scores
+#delete any potential vector with no variance 
+if (length(nearZeroVar(Z)) != 0) {
+  Z <- Z[, -nearZeroVar(Z)]
+}
+
+#Selected vars dataframe, add constant 
+sPCA.vars.df <- data.matrix(cbind(const=rep(1,D-1), Z))
+
+print(paste0("Number of components: ", ncol(Z)))
+```
+
+Total variance explained
+
+```{r}
+print(paste0("Prop. of variance explained by last component: ", summary(out)[3,ncol(Z)]))
+print(paste0("Total Variance explained: ", summary(out)[4,ncol(Z)]))
+```
+
+### 6.2 Run SFH with selected variables
+
+```{r}
+sPCA.model <- SpatialFH(prov.dir.svy$ANEMIA, # direct estimate
+                         sPCA.vars.df, # predictor vars 
+                         (prov.dir.svy$se)^2, # direct estim variance
+                         wmat) # contiguity matrix
+```
+
+## 7 Plotting
+
+In this section, we will plot estimates, standard errors and CV to check the improvement of the models versus the direct estimates. This will also let us contrast rival models.
+
+```{r}
+# vars for x-axis 
+ln_nd <- log(nd)
+ln_nd_ <- log(nd_)
+o<-order(nd_)
+```
+
+### 7.1 Create an estimates dataframe
+
+We merge all estimates and their corresponding MSE, CV, etc. in one dataframe. We also compute ratios of the model estimates and their dispersion in relation to the direct estimates.
+
+```{r}
+compar.df <- data.frame(ID_PROV = prov.dir.svy$ID_PROV,
+                        sample.size = nd_, 
+                        
+                        dir.estim = prov.dir.svy$ANEMIA, 
+                        dir.se = prov.dir.svy$se,
+                        dir.var = (prov.dir.svy$se)^2, 
+                        dir.cv = prov.dir.svy$CV,
+                        
+                        expert.estim = expert.model$SFH.estimates,
+                        expert.mse = expert.model$SFH.mse,
+                        expert.cv = expert.model$SFH.cv,
+                        
+                        stepw.estim = stepw.model$SFH.estimates,
+                        stepw.mse = stepw.model$SFH.mse,
+                        stepw.cv = stepw.model$SFH.cv,
+                        
+                        lasso.estim = lasso.model$SFH.estimates,
+                        lasso.mse = lasso.model$SFH.mse,
+                        lasso.cv = lasso.model$SFH.cv,
+                        
+                        sPCA.estim = sPCA.model$SFH.estimates,
+                        sPCA.mse = sPCA.model$SFH.mse,
+                        sPCA.cv = sPCA.model$SFH.cv)
+
+#generate ratios
+##experts
+compar.df$expert.est.ratio <- (compar.df$dir.estim/compar.df$expert.estim)*100
+compar.df$expert.se.ratio <- ((compar.df$dir.se)/sqrt(compar.df$expert.mse))*100
+compar.df$expert.cv.ratio  <- (compar.df$dir.cv/compar.df$expert.cv)*100
+
+##stepwise
+compar.df$stepw.est.ratio <- (compar.df$dir.estim/compar.df$stepw.estim)*100
+compar.df$stepw.se.ratio <- ((compar.df$dir.se)/sqrt(compar.df$stepw.mse))*100
+compar.df$stepw.cv.ratio  <- (compar.df$dir.cv/compar.df$stepw.cv)*100
+
+##lasso 
+compar.df$lasso.est.ratio <- (compar.df$dir.estim/compar.df$lasso.estim)*100
+compar.df$lasso.se.ratio <- ((compar.df$dir.se)/sqrt(compar.df$lasso.mse))*100
+compar.df$lasso.cv.ratio  <- (compar.df$dir.cv/compar.df$lasso.cv)*100
+
+##sPCA
+compar.df$sPCA.est.ratio <- (compar.df$dir.estim/compar.df$sPCA.estim)*100
+compar.df$sPCA.se.ratio <- ((compar.df$dir.se)/sqrt(compar.df$sPCA.mse))*100
+compar.df$sPCA.cv.ratio  <- (compar.df$dir.cv/compar.df$sPCA.cv)*100
+```
+
+### 7.2 Estimates convergence plot
+
+```{r}
+xlabel <- "Sample Size (log scale)"
+ylabel <- "(Direct / Spatial FH) * 100"
+note <- "Note: FH = Fay-Harriot model. X-axis in logarithmic scale. Compiled by authors."
+
+# jpeg(paste(outputs, "estimratio_Dir-vs-experts.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Estimates (experts), Peru"
+converplot(nd_, compar.df$expert.est.ratio, title, xlabel, ylabel, note) 
+
+# jpeg(paste(outputs, "estimratio_Dir-vs-stepw.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Estimates (stepwise), Peru"
+converplot(nd_, compar.df$stepw.est.ratio, title, xlabel, ylabel, note) 
+
+# jpeg(paste(outputs, "estimratio_Dir-vs-lasso.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Estimates (LASSO), Peru"
+converplot(nd_, compar.df$lasso.est.ratio, title, xlabel, ylabel, note) 
+
+# jpeg(paste(outputs, "estimratio_Dir-vs-sPCA.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Estimates (sPCA), Peru"
+converplot(nd_, compar.df$sPCA.est.ratio, title, xlabel, ylabel, note)
+```
+
+### 7.3 Standard error ratios convergence plot
+
+```{r}
+xlabel <- "Sample Size (log scale)"
+ylabel <- "(Direct / Spatial FH) * 100"
+note <- "Note: FH = Fay-Harriot model. X-axis in logarithmic scale. Compiled by authors."
+
+# jpeg(paste(outputs, "stdratio_Dir-vs-experts.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Std. Errors (experts), Peru"
+converplot(nd_, compar.df$expert.se.ratio, title, xlabel, ylabel, note)
+
+# jpeg(paste(outputs, "stdratio_Dir-vs-stepw.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Std. Errors (stepwise), Peru"
+converplot(nd_, compar.df$stepw.se.ratio, title, xlabel, ylabel, note) 
+
+# jpeg(paste(outputs, "stdratio_Dir-vs-lasso.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Std. Errors (LASSO), Peru"
+converplot(nd_, compar.df$lasso.se.ratio, title, xlabel, ylabel, note) 
+
+# jpeg(paste(outputs, "stdratio_Dir-vs-sPCA.jpg", sep="\\"),
+#      width = 500, height = 500)
+title <- "Provincial Anemia Prevalence \nRatio of Std. Errors (sPCA), Peru"
+converplot(nd_, compar.df$sPCA.se.ratio, title, xlabel, ylabel, note)
+```
+
+### 7.4 CV and sample size
+
+```{r}
+#Top 10 provinces with smallest sample size
+cv.df <- compar.df[c("sample.size", "dir.cv", 
+                     "expert.cv", "stepw.cv", 
+                     "lasso.cv", "sPCA.cv")][o[1:10],]
+cv.df
+```
+
+```{r}
+# jpeg(paste(outputs, "CV-smallest-prov-allmodels.jpg", sep="\\"),
+#      width = 750, height = 500)
+mx <- t(as.matrix(cv.df[-1]))# t(as.matrix(DF[-3]))
+colours = c("grey0","grey24", "grey48", "grey72", "grey96")
+par(mar = c(5, 4, 3, 3))
+barplot(mx, 
+        main='Coefficiente of Variation, \nprovinces with smallest sample size',
+        ylab='C.V.', xlab='Sample Size',beside = TRUE, 
+        ylim=c(0,max(mx)*1.1), names.arg = cv.df$sample.size,
+        col=colours)
+# to add a box around the plot
+box()
+
+# add a legend
+legend('topright',fill=colours,
+       legend=c('Direct','Experts', 'Stepwise', 'LASSO', 'sPCA'))
+
+abline(h=15, col="red")
+```
+
+### 7.6 Improvement of variance
+
+```{r}
+#generate ratio of improvement 
+##experts
+compar.df$expert.improv.ratio <- ((compar.df$dir.var - compar.df$expert.mse)/compar.df$dir.var)*100
+
+##stepw
+compar.df$stepw.improv.ratio <- ((compar.df$dir.var - compar.df$stepw.mse)/compar.df$dir.var)*100
+
+##lasso
+compar.df$lasso.improv.ratio <- ((compar.df$dir.var - compar.df$lasso.mse)/compar.df$dir.var)*100
+
+##sPCA
+compar.df$sPCA.improv.ratio <- ((compar.df$dir.var - compar.df$sPCA.mse)/compar.df$dir.var)*100
+```
+
+```{r}
+cols <- c("expert.improv.ratio", "stepw.improv.ratio", "lasso.improv.ratio", "sPCA.improv.ratio")
+summary(compar.df[cols])
+```
+
+The Peruvian NSO uses a threshold of CV\>15 to decide if estimates are published or not. We can count how many provincial estimates we are recovering in comparison with the direct estimation
+
+```{r}
+sum(compar.df$dir.cv>15)
+sum(compar.df$expert.cv>15)
+sum(compar.df$stepw.cv>15)
+sum(compar.df$lasso.cv>15)
+sum(compar.df$sPCA.cv>15)
+```
+
+### 7.7 AIC, BIC, loglike. Summary of point estimate
+
+```{r}
+expert.goodness <- expert.model[["SFH.object"]][["fit"]][["goodness"]]
+stepw.goodness <- stepw.model[["SFH.object"]][["fit"]][["goodness"]]
+lasso.goodness <- lasso.model[["SFH.object"]][["fit"]][["goodness"]]
+sPCA.goodness <- sPCA.model[["SFH.object"]][["fit"]][["goodness"]]
+
+goodness_matrix <- rbind(expert.goodness, stepw.goodness, lasso.goodness, sPCA.goodness)
+
+write.csv(goodness_matrix,
+          file=paste(outputs, "goodness_matrix.csv", sep="\\"))
+```
+
+```{r}
+estim.summary <- as.data.frame(apply(compar.df[c("dir.estim", "expert.estim", "stepw.estim", "lasso.estim", "sPCA.estim")], 2, summary))
+
+write.csv(estim.summary,
+          file=paste(outputs, "summary_estimates.csv", sep="\\"))
+
+jpeg(paste(outputs, "boxplot_estim.jpg", sep="\\"),
+     width = 800, height = 400)
+boxplot(compar.df[c("dir.estim", "expert.estim", "stepw.estim", "lasso.estim", "sPCA.estim")], 
+        ylab = "Anemia Prevalence (%)", staplewex=T, outwex=T,
+        border = c("grey"), col="white",
+        names = c("Direct", "Experts", "Stepwise", "LASSO", "sPCA")) 
+```
+
+### 7.8 Choropleths
+
+We plot the provincial estimates of anemia in choropleths maps.
+
+```{r}
+# jpeg(paste(outputs, "map_direct.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nDirect Estimate"
+choropleths(shp, compar.df, "ID_PROV", "dir.estim", title)
+
+# jpeg(paste(outputs, "map_expert.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nExperts"
+choropleths(shp, compar.df, "ID_PROV", "expert.estim", title)
+
+# jpeg(paste(outputs, "map_stepw.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nStepwise"
+choropleths(shp, compar.df, "ID_PROV", "stepw.estim", title)
+
+# jpeg(paste(outputs, "map_lasso.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nLASSO"
+choropleths(shp, compar.df, "ID_PROV", "lasso.estim", title)
+
+# jpeg(paste(outputs, "map_sPCA.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nsPCA"
+choropleths(shp, compar.df, "ID_PROV", "sPCA.estim", title)
+```
+
+We plot the same choropleths but we drop the estimates with a CV\>15 which is the threshold used by the INEI to publish results.
+
+```{r}
+mapdf_1 <- compar.df
+mapdf_1$dir.estim[mapdf_1$dir.cv > 15] <- NA
+mapdf_1$expert.estim[mapdf_1$expert.cv > 15] <- NA
+mapdf_1$stepw.estim[mapdf_1$stepw.cv > 15] <- NA
+mapdf_1$lasso.estim[mapdf_1$lasso.cv > 15] <- NA
+mapdf_1$sPCA.estim[mapdf_1$sPCA.cv > 15] <- NA
+```
+
+```{r}
+# jpeg(paste(outputs, "map_direct_CV15.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nDirect Estimate \n(Coef. Var. < 15)"
+choropleths(shp, mapdf_1, "ID_PROV", "dir.estim", title)
+
+# jpeg(paste(outputs, "map_expert_CV15.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nExperts (CV<15)"
+choropleths(shp, mapdf_1, "ID_PROV", "expert.estim", title)
+
+# jpeg(paste(outputs, "map_stepw_CV15.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nStepwise (CV<15)"
+choropleths(shp, mapdf_1, "ID_PROV", "stepw.estim", title)
+
+# jpeg(paste(outputs, "map_lasso_CV15.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nLASSO (CV<15)"
+choropleths(shp, mapdf_1, "ID_PROV", "lasso.estim", title)
+
+# jpeg(paste(outputs, "map_sPCA_CV15.jpg", sep="\\"),
+#      width = 400, height = 500)
+title = "Child Anemia \nSpatial Fay-Herriot \nsPCA (CV<15)"
+choropleths(shp, mapdf_1, "ID_PROV", "sPCA.estim", title)
+```
+
+## 8. Other diagnostics
+
+### 8.1 Bechmarking of model estimates
+
+We know that the DHS survey is representative at the subnational-1 level: regions. With this in mind, we can compute the share of children with anemia in each regions by the direct estimates and the SAE predictions. Ideally, the SAE predictions would not be statistically different from the direct estimates. We will prefer the model with the most similar population counts.
+
+```{r}
+bench.df <- compar.df[c("ID_PROV", 
+                        "dir.estim", "dir.se", 
+                        "expert.estim", "expert.mse",
+                        "stepw.estim", "stepw.mse",
+                        "lasso.estim", "lasso.mse",
+                        "sPCA.estim", "sPCA.mse")]
+
+bench.df$ID_PROV <- sprintf("%04d", bench.df$ID_PROV)
+```
+
+Load province population (children below 4 years)
+
+```{r}
+prov.pop <- read_excel(paste(data, "total_population", 
+                             "total_population_0-4y_provinces.xlsx", sep="\\"),
+                       sheet = "Sheet1")
+colnames(prov.pop) <- c("ID_PROV", "prov_pop")
+prov.pop$ID_DPTO <- substring(prov.pop$ID_PROV, first=1, last=2)
+
+prov.pop <- prov.pop %>%
+            group_by(ID_DPTO) %>%
+            mutate(dpto_pop = sum(prov_pop))
+
+##shares
+prov.pop$share.pop <- prov.pop$prov_pop/prov.pop$dpto_pop 
+#merge
+bench.df <- merge(bench.df, prov.pop)
+```
+
+```{r}
+#groupping at the regional level
+bench.df$dir.prov.share <- bench.df$dir.estim*bench.df$share.pop
+bench.df$expert.prov.share <- bench.df$expert.estim*bench.df$share.pop
+bench.df$stepw.prov.share <- bench.df$stepw.estim*bench.df$share.pop
+bench.df$lasso.prov.share <- bench.df$lasso.estim*bench.df$share.pop
+bench.df$sPCA.prov.share <- bench.df$sPCA.estim*bench.df$share.pop
+
+bench.df <- bench.df %>% 
+            group_by(ID_DPTO) %>%
+            summarize(dir.dpto.share = sum(dir.prov.share),
+                      expert.dpto.share = sum(expert.prov.share),
+                      stepw.dpto.share = sum(stepw.prov.share),
+                      lasso.dpto.share = sum(lasso.prov.share),
+                      sPCA.dpto.share = sum(sPCA.prov.share))
+```
+
+```{r}
+#direct estimates from survey 
+
+#erase the provinces not used in the provincial estimates
+#Filter provinces. Drop vars with NA
+endes <- endes %>% 
+          filter(!(endes$ID_PROV=="1608" | 
+                  endes$ID_PROV=="209"))
+
+dpto.dir.svy <- svyby(~ANEMIA, 
+                        ~ID_DEP, 
+                        dclus2, 
+                        svymean, 
+                        na.rm=T)
+colnames(dpto.dir.svy) <- c("ID_DPTO", "svy.estim", "svy.se")
+bench.df <- merge(bench.df, dpto.dir.svy)
+
+bench.df$lb <- bench.df$svy.estim - (1.96 * bench.df$svy.se)
+bench.df$ub <- bench.df$svy.estim + (1.96 * bench.df$svy.se)
+
+write_xlsx(bench.df, paste("04_results", "benchmarking.xls", sep="\\"))
+```
+
+### 8.2 Benchmarking of synthetic estimates
+
+```{r}
+synth.df <- data.frame(ID_PROV = prov.dir.svy$ID_PROV,
+                        sample.size = nd_, 
+                        
+                        dir.estim = prov.dir.svy$ANEMIA, 
+                        dir.se = prov.dir.svy$se,
+
+                        expert.estim = expert.model$SFH.synth,
+                        stepw.estim = stepw.model$SFH.synth,
+                        lasso.estim = lasso.model$SFH.synth,
+                        sPCA.estim = sPCA.model$SFH.synth)
+
+synth.df$ID_PROV <- sprintf("%04d", synth.df$ID_PROV)
+
+synth.df <- merge(synth.df, prov.pop)
+```
+
+```{r}
+#groupping at the regional level
+synth.df$expert.prov.share <- synth.df$expert.estim*synth.df$share.pop
+synth.df$stepw.prov.share <- synth.df$stepw.estim*synth.df$share.pop
+synth.df$lasso.prov.share <- synth.df$lasso.estim*synth.df$share.pop
+synth.df$sPCA.prov.share <- synth.df$sPCA.estim*synth.df$share.pop
+
+synth.df <- synth.df %>% 
+            group_by(ID_DPTO) %>%
+            summarize(expert.dpto.share = sum(expert.prov.share),
+                      stepw.dpto.share = sum(stepw.prov.share),
+                      lasso.dpto.share = sum(lasso.prov.share),
+                      sPCA.dpto.share = sum(sPCA.prov.share))
+
+synth.df <- merge(synth.df, dpto.dir.svy)
+
+synth.df$lb <- synth.df$svy.estim - (1.96 * synth.df$svy.se)
+synth.df$ub <- synth.df$svy.estim + (1.96 * synth.df$svy.se)
+
+write_xlsx(synth.df, paste("04_results", "benchmarking_synth.xls", sep="\\"))
+```
+
+### 8.3 Total children in recovered provinces (non-suppressed with SAE)
+
+```{r}
+prov.pop2 <- transform(prov.pop,
+                   ID_PROV = as.numeric(ID_PROV))
+child.df <- merge(compar.df[c("ID_PROV", "dir.cv", "stepw.estim")], 
+                  prov.pop2[c("ID_PROV", "prov_pop")])
+child.df$anemic.child <- child.df$stepw.estim * child.df$prov_pop  
+
+print(c("Total children in recovered provinces (CV>15)", 
+        round(sum(subset(child.df, dir.cv>15, "anemic.child")))))
+```
+
+## END
