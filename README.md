@@ -35,7 +35,7 @@ Our study focuses on estimating **anemia prevalence among children under five in
 - The approach **helped identify 30,000 children with anemia** who would have been overlooked by direct survey methods.
 
 ![SAE vs Direct Estimates](images/sae_vs_direct.png)
-*Comparison of direct estimates (left) and SAE model estimates (right) at the province level.*
+*Comparison of direct estimates and SAE model estimates and standard errors at the province level.*
 
 ## Methodology
 ### 1. Small Area Estimation Models Used
