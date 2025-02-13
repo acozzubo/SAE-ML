@@ -55,8 +55,6 @@ Our study focuses on estimating **anemia prevalence among children under five in
 ## Repository Structure
 ```
 ├── 02_scripts/       # R scripts for data processing and analysis
-├── 04_results/       # Output data and figures
-├── 05_deliverables/  # Final report and presentations
 ├── images/           # Visualizations and figures for README
 ├── README.md         # Project description
 ├── LICENSE           # MIT License
